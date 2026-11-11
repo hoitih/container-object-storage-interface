@@ -31,6 +31,7 @@ import (
 	kube "k8s.io/client-go/kubernetes"
 	kubecorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	cosiapi "sigs.k8s.io/container-object-storage-interface/client/apis"
 	"sigs.k8s.io/container-object-storage-interface/client/apis/objectstorage/consts"
@@ -372,32 +373,54 @@ func (bal *BucketAccessListener) deleteBucketAccessOp(ctx context.Context, bucke
 	credSecretName := bucketAccess.Spec.CredentialsSecretName
 	secret, err := bal.secrets(bucketAccess.ObjectMeta.Namespace).Get(ctx, credSecretName, metav1.GetOptions{})
 	if err != nil {
-		return err
-	}
-
-	if controllerutil.RemoveFinalizer(secret, consts.SecretFinalizer) {
-		_, err = bal.secrets(secret.ObjectMeta.Namespace).Update(ctx, secret, metav1.UpdateOptions{})
-		if err != nil {
-			klog.V(3).ErrorS(err, "Error removing finalizer from secret",
-				"secret", secret.ObjectMeta.Name,
-				"bucketAccess", bucketAccess.ObjectMeta.Name)
+		if !kubeerrors.IsNotFound(err) {
 			return err
 		}
+		// A previous partially-completed deletion already removed the secret. Treat as success so
+		// that deletion remains idempotent and can proceed to bucketAccess finalizer removal.
+		klog.V(5).Infof("Credentials secret already deleted: %s, bucketAccess: %s", credSecretName, bucketAccess.ObjectMeta.Name)
+	} else {
+		if controllerutil.RemoveFinalizer(secret, consts.SecretFinalizer) {
+			_, err = bal.secrets(secret.ObjectMeta.Namespace).Update(ctx, secret, metav1.UpdateOptions{})
+			if err != nil && !kubeerrors.IsNotFound(err) {
+				klog.V(3).ErrorS(err, "Error removing finalizer from secret",
+					"secret", secret.ObjectMeta.Name,
+					"bucketAccess", bucketAccess.ObjectMeta.Name)
+				return err
+			}
 
-		klog.V(5).Infof("Successfully removed finalizer from secret: %s, bucketAccess: %s", secret.ObjectMeta.Name, bucketAccess.ObjectMeta.Name)
+			klog.V(5).Infof("Successfully removed finalizer from secret: %s, bucketAccess: %s", secret.ObjectMeta.Name, bucketAccess.ObjectMeta.Name)
+		}
+
+		err = bal.secrets(secret.ObjectMeta.Namespace).Delete(ctx, credSecretName, metav1.DeleteOptions{})
+		if err != nil && !kubeerrors.IsNotFound(err) {
+			klog.V(3).ErrorS(err, "Error deleting secret",
+				"secret", secret.ObjectMeta.Name,
+				"bucketAccess", bucketAccess.ObjectMeta.Name,
+				"ns", bucketAccess.ObjectMeta.Namespace)
+			// Returning the error (instead of swallowing it) requeues the deletion so the
+			// bucketAccess finalizer is not silently left in place forever.
+			return err
+		}
 	}
 
-	err = bal.secrets(secret.ObjectMeta.Namespace).Delete(ctx, credSecretName, metav1.DeleteOptions{})
-	if err != nil {
-		klog.V(3).ErrorS(err, "Error deleting secret",
-			"secret", secret.ObjectMeta.Name,
-			"bucketAccess", bucketAccess.ObjectMeta.Name,
-			"ns", bucketAccess.ObjectMeta.Namespace)
-		return nil
-	}
-
-	if controllerutil.RemoveFinalizer(bucketAccess, consts.BAFinalizer) {
-		_, err = bal.bucketAccesses(bucketAccess.ObjectMeta.Namespace).Update(ctx, bucketAccess, metav1.UpdateOptions{})
+	if controllerutil.ContainsFinalizer(bucketAccess, consts.BAFinalizer) {
+		// Retry on conflict against a freshly-read object so that a concurrent update does not
+		// force the whole delete operation (including driver revocation) to run again.
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh, err := bal.bucketAccesses(bucketAccess.ObjectMeta.Namespace).Get(ctx, bucketAccess.ObjectMeta.Name, metav1.GetOptions{})
+			if err != nil {
+				if kubeerrors.IsNotFound(err) {
+					return nil // already deleted = success
+				}
+				return err
+			}
+			if !controllerutil.RemoveFinalizer(fresh, consts.BAFinalizer) {
+				return nil // finalizer already removed = success
+			}
+			_, err = bal.bucketAccesses(fresh.ObjectMeta.Namespace).Update(ctx, fresh, metav1.UpdateOptions{})
+			return err
+		})
 		if err != nil {
 			klog.V(3).ErrorS(err, "Error removing finalizer from bucketAccess",
 				"bucketAccess", bucketAccess.ObjectMeta.Name)

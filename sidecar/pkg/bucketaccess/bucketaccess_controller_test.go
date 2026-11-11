@@ -30,7 +30,9 @@ import (
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	fakekubeclientset "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/container-object-storage-interface/client/apis/objectstorage/consts"
 	"sigs.k8s.io/container-object-storage-interface/client/apis/objectstorage/v1alpha1"
@@ -591,5 +593,179 @@ func TestAddDeletedBucketAccess(t *testing.T) {
 
 	if _, err := bal.secrets(ns).Get(context.TODO(), "creds", metav1.GetOptions{}); !kubeerrors.IsNotFound(err) {
 		t.Fatalf("secret was not cleaned up, err=%v", err)
+	}
+}
+
+// newDeletedBucketAccessFixtures returns stub objects for delete-path tests: a BucketAccess with a
+// deletion timestamp plus the BucketAccessClass, BucketClaim, Bucket, and credentials Secret that
+// the delete path looks up.
+func newDeletedBucketAccessFixtures(
+	driver, ns, baName string,
+) (*v1alpha1.BucketAccessClass, *v1alpha1.BucketClaim, *v1alpha1.Bucket, *v1alpha1.BucketAccess, *v1.Secret) {
+	bac := &v1alpha1.BucketAccessClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "bac"},
+		DriverName: driver,
+	}
+	claim := &v1alpha1.BucketClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: ns},
+		Status: v1alpha1.BucketClaimStatus{
+			BucketReady: true,
+			BucketName:  "bucket",
+		},
+	}
+	bucket := &v1alpha1.Bucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "bucket"},
+		Status: v1alpha1.BucketStatus{
+			BucketReady: true,
+			BucketID:    "id",
+		},
+	}
+
+	now := metav1.Now()
+	ba := &v1alpha1.BucketAccess{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              baName,
+			Namespace:         ns,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{consts.BAFinalizer},
+		},
+		Spec: v1alpha1.BucketAccessSpec{
+			BucketClaimName:       claim.Name,
+			BucketAccessClassName: bac.Name,
+			CredentialsSecretName: "creds",
+		},
+		Status: v1alpha1.BucketAccessStatus{
+			AccountID:     "acc",
+			AccessGranted: true,
+		},
+	}
+
+	secret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "creds",
+			Namespace:  ns,
+			Finalizers: []string{consts.SecretFinalizer},
+		},
+		StringData: map[string]string{"dummy": "val"},
+	}
+
+	return bac, claim, bucket, ba, secret
+}
+
+// A deletion retry must succeed when a previous partially-completed deletion already removed the
+// credentials Secret: the NotFound must be treated as success so the bucketAccess finalizer can
+// still be removed.
+func TestDeleteBucketAccessSecretAlreadyDeleted(t *testing.T) {
+	driver := "driver"
+	baName := "bucketaccess-deleted"
+	ns := "testns"
+
+	revokeCalls := 0
+	mpc := struct{ fakespec.FakeProvisionerClient }{}
+	mpc.FakeDriverRevokeBucketAccess = func(
+		_ context.Context,
+		_ *cosi.DriverRevokeBucketAccessRequest,
+		_ ...grpc.CallOption,
+	) (*cosi.DriverRevokeBucketAccessResponse, error) {
+		revokeCalls++
+		return &cosi.DriverRevokeBucketAccessResponse{}, nil
+	}
+
+	bac, claim, bucket, ba, _ := newDeletedBucketAccessFixtures(driver, ns, baName)
+
+	client := fakebucketclientset.NewSimpleClientset(bac, claim, bucket, ba)
+	kubeClient := fakekubeclientset.NewSimpleClientset() // secret already deleted
+
+	bal := BucketAccessListener{
+		driverName:        driver,
+		provisionerClient: &mpc,
+		bucketClient:      client,
+		kubeClient:        kubeClient,
+	}
+
+	if err := bal.Add(context.TODO(), ba); err != nil {
+		t.Fatalf("Add returned error for deleted BucketAccess with already-deleted secret: %v", err)
+	}
+
+	if revokeCalls != 1 {
+		t.Fatalf("expected exactly 1 revoke call, got %d", revokeCalls)
+	}
+
+	persisted, err := bal.bucketAccesses(ns).Get(context.TODO(), baName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get BucketAccess: %v", err)
+	}
+	if len(persisted.Finalizers) != 0 {
+		t.Fatalf("bucketAccess finalizer was not removed, finalizers=%v", persisted.Finalizers)
+	}
+}
+
+// A conflict on the bucketAccess finalizer-removal update must be retried against a fresh object
+// within the same delete operation instead of failing it, which would repeat the whole delete flow
+// including driver revocation.
+func TestDeleteBucketAccessFinalizerUpdateConflict(t *testing.T) {
+	driver := "driver"
+	baName := "bucketaccess-deleted"
+	ns := "testns"
+
+	revokeCalls := 0
+	mpc := struct{ fakespec.FakeProvisionerClient }{}
+	mpc.FakeDriverRevokeBucketAccess = func(
+		_ context.Context,
+		_ *cosi.DriverRevokeBucketAccessRequest,
+		_ ...grpc.CallOption,
+	) (*cosi.DriverRevokeBucketAccessResponse, error) {
+		revokeCalls++
+		return &cosi.DriverRevokeBucketAccessResponse{}, nil
+	}
+
+	bac, claim, bucket, ba, secret := newDeletedBucketAccessFixtures(driver, ns, baName)
+
+	client := fakebucketclientset.NewSimpleClientset(bac, claim, bucket, ba)
+	kubeClient := fakekubeclientset.NewSimpleClientset(secret)
+
+	// simulate a concurrent writer racing the first finalizer-removal update
+	conflictsRemaining := 1
+	client.PrependReactor("update", "bucketaccesses",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if conflictsRemaining > 0 {
+				conflictsRemaining--
+				return true, nil, kubeerrors.NewConflict(
+					schema.GroupResource{Group: v1alpha1.SchemeGroupVersion.Group, Resource: "bucketaccesses"},
+					baName,
+					errors.New("the object has been modified; please apply your changes to the latest version and try again"),
+				)
+			}
+			return false, nil, nil
+		})
+
+	bal := BucketAccessListener{
+		driverName:        driver,
+		provisionerClient: &mpc,
+		bucketClient:      client,
+		kubeClient:        kubeClient,
+	}
+
+	if err := bal.Add(context.TODO(), ba); err != nil {
+		t.Fatalf("Add returned error for deleted BucketAccess with conflicting finalizer update: %v", err)
+	}
+
+	if conflictsRemaining != 0 {
+		t.Fatalf("conflict was never returned by the fake client")
+	}
+	if revokeCalls != 1 {
+		t.Fatalf("expected exactly 1 revoke call, got %d", revokeCalls)
+	}
+
+	if _, err := bal.secrets(ns).Get(context.TODO(), "creds", metav1.GetOptions{}); !kubeerrors.IsNotFound(err) {
+		t.Fatalf("secret was not cleaned up, err=%v", err)
+	}
+
+	persisted, err := bal.bucketAccesses(ns).Get(context.TODO(), baName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get BucketAccess: %v", err)
+	}
+	if len(persisted.Finalizers) != 0 {
+		t.Fatalf("bucketAccess finalizer was not removed, finalizers=%v", persisted.Finalizers)
 	}
 }
