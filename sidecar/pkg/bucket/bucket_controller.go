@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	kube "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/container-object-storage-interface/client/apis/objectstorage/consts"
 	"sigs.k8s.io/container-object-storage-interface/client/apis/objectstorage/v1alpha1"
@@ -231,7 +232,7 @@ func (b *BucketListener) Update(ctx context.Context, old, new *v1alpha1.Bucket) 
 }
 
 func (b *BucketListener) handleDeletion(ctx context.Context, bucket *v1alpha1.Bucket) error {
-	var err error
+	finalizersToRemove := []string{}
 
 	if controllerutil.ContainsFinalizer(bucket, consts.BABucketFinalizer) {
 		bucketClaimNs := bucket.Spec.BucketClaim.Namespace
@@ -246,7 +247,8 @@ func (b *BucketListener) handleDeletion(ctx context.Context, bucket *v1alpha1.Bu
 
 		for _, ba := range bucketAccessList.Items {
 			if strings.EqualFold(ba.Spec.BucketClaimName, bucketClaimName) {
-				if err = b.bucketAccesses(bucketClaimNs).Delete(ctx, ba.Name, metav1.DeleteOptions{}); err != nil {
+				err = b.bucketAccesses(bucketClaimNs).Delete(ctx, ba.Name, metav1.DeleteOptions{})
+				if err != nil && !kubeerrors.IsNotFound(err) {
 					klog.V(3).ErrorS(err, "Error deleting BucketAccess",
 						"name", ba.Name,
 						"bucket", bucket.ObjectMeta.Name)
@@ -255,17 +257,43 @@ func (b *BucketListener) handleDeletion(ctx context.Context, bucket *v1alpha1.Bu
 			}
 		}
 
-		controllerutil.RemoveFinalizer(bucket, consts.BABucketFinalizer)
+		finalizersToRemove = append(finalizersToRemove, consts.BABucketFinalizer)
 	}
 
 	if controllerutil.ContainsFinalizer(bucket, consts.BucketFinalizer) {
-		if err = b.deleteBucketOp(ctx, bucket); err != nil {
+		if err := b.deleteBucketOp(ctx, bucket); err != nil {
 			return b.recordError(bucket, v1.EventTypeWarning, v1alpha1.FailedDeleteBucket, err)
 		}
-		controllerutil.RemoveFinalizer(bucket, consts.BucketFinalizer)
+		finalizersToRemove = append(finalizersToRemove, consts.BucketFinalizer)
 	}
 
-	if _, err = b.buckets().Update(ctx, bucket, metav1.UpdateOptions{}); err != nil {
+	if len(finalizersToRemove) == 0 {
+		return nil
+	}
+
+	// Retry on conflict against a freshly-read object so that a concurrent update does not force
+	// the whole deletion (including the driver DeleteBucket call) to run again.
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh, err := b.buckets().Get(ctx, bucket.ObjectMeta.Name, metav1.GetOptions{})
+		if err != nil {
+			if kubeerrors.IsNotFound(err) {
+				return nil // already deleted = success
+			}
+			return err
+		}
+		changed := false
+		for _, finalizer := range finalizersToRemove {
+			if controllerutil.RemoveFinalizer(fresh, finalizer) {
+				changed = true
+			}
+		}
+		if !changed {
+			return nil // finalizers already removed = success
+		}
+		_, err = b.buckets().Update(ctx, fresh, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
 		klog.V(3).ErrorS(err, "Error updating bucket after removing finalizers",
 			"bucket", bucket.ObjectMeta.Name)
 		return err
@@ -291,6 +319,10 @@ func (b *BucketListener) Delete(ctx context.Context, inputBucket *v1alpha1.Bucke
 
 		bucketClaim, err := b.bucketClaims(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 		if err != nil {
+			if kubeerrors.IsNotFound(err) {
+				klog.V(5).Infof("BucketClaim already deleted: %s for bucket: %s", ref.Name, inputBucket.ObjectMeta.Name)
+				return nil
+			}
 			klog.V(3).ErrorS(err, "Error getting bucketClaim for removing finalizer",
 				"bucket", inputBucket.ObjectMeta.Name,
 				"bucketClaim", ref.Name)
@@ -299,7 +331,7 @@ func (b *BucketListener) Delete(ctx context.Context, inputBucket *v1alpha1.Bucke
 
 		if controllerutil.RemoveFinalizer(bucketClaim, consts.BCFinalizer) {
 			_, err := b.bucketClaims(bucketClaim.ObjectMeta.Namespace).Update(ctx, bucketClaim, metav1.UpdateOptions{})
-			if err != nil {
+			if err != nil && !kubeerrors.IsNotFound(err) {
 				klog.V(3).ErrorS(err, "Error removing bucketClaim finalizer",
 					"bucket", inputBucket.ObjectMeta.Name,
 					"bucketClaim", bucketClaim.ObjectMeta.Name)
@@ -356,6 +388,13 @@ func (b *BucketListener) deleteBucketOp(ctx context.Context, bucket *v1alpha1.Bu
 		ref := bucket.Spec.BucketClaim
 		bucketClaim, err := b.bucketClaims(ref.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 		if err != nil {
+			if kubeerrors.IsNotFound(err) {
+				// A previous partially-completed deletion already removed the bucketClaim
+				// finalizer and the claim is gone. Treat as success so that deletion remains
+				// idempotent and can proceed to bucket finalizer removal.
+				klog.V(5).Infof("BucketClaim already deleted: %s for bucket: %s", ref.Name, bucket.ObjectMeta.Name)
+				return nil
+			}
 			klog.V(3).ErrorS(err, "Error fetching bucketClaim",
 				"bucketClaim", ref.Name,
 				"bucket", bucket.ObjectMeta.Name)
@@ -363,7 +402,8 @@ func (b *BucketListener) deleteBucketOp(ctx context.Context, bucket *v1alpha1.Bu
 		}
 
 		if controllerutil.RemoveFinalizer(bucketClaim, consts.BCFinalizer) {
-			if _, err := b.bucketClaims(bucketClaim.ObjectMeta.Namespace).Update(ctx, bucketClaim, metav1.UpdateOptions{}); err != nil {
+			_, err := b.bucketClaims(bucketClaim.ObjectMeta.Namespace).Update(ctx, bucketClaim, metav1.UpdateOptions{})
+			if err != nil && !kubeerrors.IsNotFound(err) {
 				klog.V(3).ErrorS(err, "Error removing finalizer from bucketClaim",
 					"bucketClaim", bucketClaim.ObjectMeta.Name,
 					"bucket", bucket.ObjectMeta.Name)

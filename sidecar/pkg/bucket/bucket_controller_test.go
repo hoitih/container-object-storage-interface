@@ -29,7 +29,9 @@ import (
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	fakekubeclientset "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/container-object-storage-interface/client/apis/objectstorage/consts"
 	"sigs.k8s.io/container-object-storage-interface/client/apis/objectstorage/v1alpha1"
@@ -425,5 +427,159 @@ func TestAddSetsBucketClaimBucketName(t *testing.T) {
 
 	if got.Status.BucketName != bucket.Name {
 		t.Errorf("expected BucketClaim.Status.BucketName to be %q, got %q", bucket.Name, got.Status.BucketName)
+	}
+}
+
+// newDeletedBucketFixtures returns stub objects for delete-path tests: a Bucket with a deletion
+// timestamp and finalizers, plus the BucketClaim it references.
+func newDeletedBucketFixtures(driver, ns string) (*v1alpha1.Bucket, *v1alpha1.BucketClaim) {
+	now := metav1.Now()
+	bucket := &v1alpha1.Bucket{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "testbucket",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{consts.BucketFinalizer},
+		},
+		Spec: v1alpha1.BucketSpec{
+			DriverName:      driver,
+			BucketClassName: "bucketclass",
+			DeletionPolicy:  v1alpha1.DeletionPolicyDelete,
+			BucketClaim: &v1.ObjectReference{
+				Name:      "claim",
+				Namespace: ns,
+			},
+		},
+		Status: v1alpha1.BucketStatus{
+			BucketReady: true,
+			BucketID:    "id",
+		},
+	}
+	bucketClaim := &v1alpha1.BucketClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "claim",
+			Namespace:  ns,
+			Finalizers: []string{consts.BCFinalizer},
+		},
+		Status: v1alpha1.BucketClaimStatus{
+			BucketReady: true,
+			BucketName:  "testbucket",
+		},
+	}
+	return bucket, bucketClaim
+}
+
+// A deletion retry must succeed when a previous partially-completed deletion already removed the
+// bucketClaim finalizer and the claim is gone: the NotFound must be treated as success so the
+// bucket finalizer can still be removed.
+func TestDeleteBucketClaimAlreadyDeleted(t *testing.T) {
+	driver := "driver1"
+	ns := "testns"
+
+	deleteCalls := 0
+	mpc := struct{ fakespec.FakeProvisionerClient }{}
+	mpc.FakeDriverDeleteBucket = func(
+		_ context.Context,
+		_ *cosi.DriverDeleteBucketRequest,
+		_ ...grpc.CallOption,
+	) (*cosi.DriverDeleteBucketResponse, error) {
+		deleteCalls++
+		return &cosi.DriverDeleteBucketResponse{}, nil
+	}
+
+	bucket, _ := newDeletedBucketFixtures(driver, ns)
+
+	client := fakebucketclientset.NewSimpleClientset(bucket) // bucketClaim already deleted
+
+	bl := BucketListener{
+		driverName:        driver,
+		provisionerClient: &mpc,
+	}
+	bl.InitializeBucketClient(client)
+
+	if err := bl.Update(context.TODO(), bucket, bucket); err != nil {
+		t.Fatalf("Update returned error for deleted bucket with already-deleted bucketClaim: %v", err)
+	}
+
+	if deleteCalls != 1 {
+		t.Fatalf("expected exactly 1 driver delete call, got %d", deleteCalls)
+	}
+
+	persisted, err := client.ObjectstorageV1alpha1().Buckets().Get(context.TODO(), bucket.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get Bucket: %v", err)
+	}
+	if len(persisted.Finalizers) != 0 {
+		t.Fatalf("bucket finalizer was not removed, finalizers=%v", persisted.Finalizers)
+	}
+}
+
+// A conflict on the bucket finalizer-removal update must be retried against a fresh object within
+// the same delete operation instead of failing it, which would repeat the whole delete flow
+// including the driver DeleteBucket call.
+func TestDeleteBucketFinalizerUpdateConflict(t *testing.T) {
+	driver := "driver1"
+	ns := "testns"
+
+	deleteCalls := 0
+	mpc := struct{ fakespec.FakeProvisionerClient }{}
+	mpc.FakeDriverDeleteBucket = func(
+		_ context.Context,
+		_ *cosi.DriverDeleteBucketRequest,
+		_ ...grpc.CallOption,
+	) (*cosi.DriverDeleteBucketResponse, error) {
+		deleteCalls++
+		return &cosi.DriverDeleteBucketResponse{}, nil
+	}
+
+	bucket, bucketClaim := newDeletedBucketFixtures(driver, ns)
+
+	client := fakebucketclientset.NewSimpleClientset(bucket, bucketClaim)
+
+	// simulate a concurrent writer racing the first finalizer-removal update
+	conflictsRemaining := 1
+	client.PrependReactor("update", "buckets",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if conflictsRemaining > 0 {
+				conflictsRemaining--
+				return true, nil, kubeerrors.NewConflict(
+					schema.GroupResource{Group: v1alpha1.SchemeGroupVersion.Group, Resource: "buckets"},
+					bucket.Name,
+					errors.New("the object has been modified; please apply your changes to the latest version and try again"),
+				)
+			}
+			return false, nil, nil
+		})
+
+	bl := BucketListener{
+		driverName:        driver,
+		provisionerClient: &mpc,
+	}
+	bl.InitializeBucketClient(client)
+
+	if err := bl.Update(context.TODO(), bucket, bucket); err != nil {
+		t.Fatalf("Update returned error for deleted bucket with conflicting finalizer update: %v", err)
+	}
+
+	if conflictsRemaining != 0 {
+		t.Fatalf("conflict was never returned by the fake client")
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("expected exactly 1 driver delete call, got %d", deleteCalls)
+	}
+
+	persistedBucket, err := client.ObjectstorageV1alpha1().Buckets().Get(context.TODO(), bucket.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get Bucket: %v", err)
+	}
+	if len(persistedBucket.Finalizers) != 0 {
+		t.Fatalf("bucket finalizer was not removed, finalizers=%v", persistedBucket.Finalizers)
+	}
+
+	persistedClaim, err := client.ObjectstorageV1alpha1().BucketClaims(ns).Get(context.TODO(), bucketClaim.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get BucketClaim: %v", err)
+	}
+	if len(persistedClaim.Finalizers) != 0 {
+		t.Fatalf("bucketClaim finalizer was not removed, finalizers=%v", persistedClaim.Finalizers)
 	}
 }
