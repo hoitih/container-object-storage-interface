@@ -204,7 +204,6 @@ func (c *ObjectStorageController) Run(ctx context.Context) error {
 		return fmt.Errorf("error getting the default leader identity: %v", err)
 	}
 
-	c.eventBroadcaster.StartRecordingToSink(&corev1.EventSinkImpl{Interface: c.kubeClient.CoreV1().Events(ns)})
 	defer c.eventBroadcaster.Shutdown()
 
 	rlConfig := resourcelock.ResourceLockConfig{
