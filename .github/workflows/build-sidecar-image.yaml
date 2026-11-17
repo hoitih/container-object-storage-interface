@@ -37,5 +37,5 @@ jobs:
           file: sidecar/Dockerfile
           push: true
           tags: |
-            ghcr.io/hoitih/cosi-provisioner-sidecar:fix-idempotent-delete
-            ghcr.io/hoitih/cosi-provisioner-sidecar:${{ env.SHORT_SHA }}
+            ghcr.io/hoitih/objectstorage-sidecar:fix-idempotent-delete
+            ghcr.io/hoitih/objectstorage-sidecar:${{ env.SHORT_SHA }}
